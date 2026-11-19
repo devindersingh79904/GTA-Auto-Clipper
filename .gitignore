@@ -23,3 +23,6 @@ models/person_yolox_s_2022nov.onnx
 client_secret.json
 client_secret*.json
 token.json
+
+# Music: generated beats and your own tracks stay local
+music/

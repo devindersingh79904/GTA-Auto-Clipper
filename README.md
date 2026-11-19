@@ -71,6 +71,18 @@ Test a local video first. Test output goes to `test_out/` and cannot be publishe
 python clip.py --file "C:\videos\gameplay.mp4" --test --clip-len 30
 ```
 
+## Music or your own commentary instead of the streamer's voice
+
+`--audio music` replaces the source audio with royalty-free music. Put tracks (for example from YouTube Studio > Audio Library) in `music/`; if a track needs attribution, put the credit in a `.txt` with the same name and it is added to the description. If `music/` is empty, original beats are generated automatically (`python music_gen.py`), so no download or credit is needed. `--audio mute` renders silent clips ready for a voice-over. Both turn the speech captions off.
+
+```powershell
+python clip.py URL --gameplay-confirmed --audio music --top 1
+python add_audio.py output\gta-CLIP-ID                      # re-score an existing clip with music
+python add_audio.py output\gta-CLIP-ID --voice take.m4a     # your commentary + quiet music, with captions
+```
+
+`add_audio.py` writes a new `-music` or `-voice` clip next to the original and clears its title, so run `llm_metadata.py` on the new clip. Removing the streamer's voice does not change who owns the footage: you still need the creator's permission.
+
 ## Schedule to YouTube + Instagram
 
 Connect your YouTube account and an Instagram Creator or Business account to Zernio. Set the key and account IDs as private environment variables:

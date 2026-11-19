@@ -605,17 +605,34 @@ def video_encoder_args(encoder):
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]
 
 
+def audio_args(audio_mode, length, music=None):
+    """Extra ffmpeg inputs and the audio part of the filter graph. Input 0 is always the source video."""
+    import audio_mix
+    if audio_mode == "music":
+        track, offset = music
+        return audio_mix.music_input(track, offset), audio_mix.music_filter("1:a", length)
+    if audio_mode == "mute":
+        return audio_mix.silence_input(), audio_mix.silence_filter("1:a", length)
+    return [], "[0:a]asetpts=PTS-STARTPTS[aout]"
+
+
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
-        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
+        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None, audio_mode="original", music=None):
+    """Render one vertical clip. audio_mode "music" replaces the source audio with music=(track, offset);
+    "mute" leaves a silent track ready for a voice-over (add_audio.py). Both drop the speech captions."""
     d = os.path.dirname(out_mp4)
     ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
+    if audio_mode != "original":
+        words = WordTimings([], getattr(words, "spoken_language", "unknown"), "none")
     write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
                             pan_keys=pan_keys)
+    extra_inputs, audio_filter = audio_args(audio_mode, length, music)
+    graph = fg + "[vout];" + audio_filter
     def render(encoder):
         return subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                               "-i", os.path.abspath(chunk_path), "-t", f"{length}",
-                               "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
+                               "-i", os.path.abspath(chunk_path), *extra_inputs, "-t", f"{length}",
+                               "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
                                *video_encoder_args(encoder),
                                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
                                os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
@@ -665,6 +682,10 @@ def main():
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--keep-minutes", type=int, default=30)
     ap.add_argument("--output-dir", default=None, help="override the output folder")
+    ap.add_argument("--audio", choices=("original", "music", "mute"), default="original",
+                    help="original: stream audio + speech captions. music: replace it with royalty-free music "
+                         "(music/ folder, or generated beats if empty). mute: silent, ready for add_audio.py --voice")
+    ap.add_argument("--music", default=None, help="music file or folder for --audio music (default: music/)")
     a = ap.parse_args()
     global _forced_language
     _forced_language = None if a.spoken_language == "auto" else a.spoken_language
@@ -685,6 +706,18 @@ def main():
                  "Then rerun with --gameplay-confirmed. A GTA title or facecam alone is not gameplay.")
     if a.no_chat:
         a.moment_source = "audio"
+    tracks = []
+    if a.audio == "music":
+        import audio_mix
+        tracks = audio_mix.music_tracks(a.music)
+        if not tracks and a.music:
+            sys.exit(f"No music files found at {a.music}")
+        if not tracks:
+            import music_gen
+            print("music/ is empty: generating royalty-free beats ...")
+            music_gen.ensure_tracks(audio_mix.MUSIC_DIR)
+            tracks = audio_mix.music_tracks()
+        print(f"audio: music ({len(tracks)} track(s)); speech captions off")
 
     if a.url:
         info = stream_info(a.url)
@@ -753,10 +786,15 @@ def main():
                     pan_keys = track_player(c, start, a.clip_len)
                     if pan_keys is None:                  # driving / cutscene: the car sits mid-frame
                         crop_offset = 0.5
+                music = None
+                if a.audio == "music":
+                    import audio_mix
+                    music = audio_mix.pick_music(tracks, n_clips, a.clip_len)
                 caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi)
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                        crop_offset=crop_offset, source_roi=source_roi,
-                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys):
+                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
+                       audio_mode=a.audio, music=music):
                     n_clips += 1
                     text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
                     chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
@@ -772,8 +810,11 @@ def main():
                             "streamer": who["name"], "credit": who.get("credit"), "stream_title": title,
                             "score": score, "transcript": text,
                             "spoken_language": getattr(words, "spoken_language", "unknown"),
-                            "caption_language": getattr(words, "caption_language", "English"),
-                            "caption_fallback_reason": getattr(words, "caption_fallback_reason", None),
+                            "caption_language": getattr(words, "caption_language", "English") if a.audio == "original" else "none",
+                            "caption_fallback_reason": getattr(words, "caption_fallback_reason", None) if a.audio == "original" else f"original audio replaced ({a.audio})",
+                            "audio_mode": a.audio,
+                            "music_track": os.path.basename(music[0]) if music else None,
+                            "music_credit": audio_mix.music_credit(music[0]) if music else None,
                             "caption_position": "lower-third-of-visible-gameplay",
                             "framing": "fill-9x16" if smart_crop else "full-source-blur-fill",
                             "gameplay_confirmed": a.gameplay_confirmed,

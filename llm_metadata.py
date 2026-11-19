@@ -37,7 +37,7 @@ Spoken words in the clip (may be empty, may be Hinglish): {transcript}
 Return JSON with:
 - title: catchy, at most 80 characters, no hashtags, no quotes, no clickbait lies
 - description: 1-2 short sentences about the clip
-- hashtags: 3-6 relevant tags without spaces, each starting with #, always including #Shorts"""
+- hashtags: 3-6 relevant tags without spaces, each starting with #, always including #Shorts{avoid}"""
 
 
 def clip_paths(arg):
@@ -80,13 +80,20 @@ def finalize(raw, metadata):
         description += f"\n\nCredit: {metadata['credit']}"
         if metadata.get("source_url", "").startswith("http"):
             description += f" ({metadata['source_url']})"
+    if metadata.get("music_credit"):
+        description += f"\nMusic: {metadata['music_credit']}"
     description = (description + "\n\n" + " ".join(tags)).strip()
     return title, description[:4900], tags
 
 
-def ask_ollama(metadata, model=None, url=None, timeout=300):
+def ask_ollama(metadata, model=None, url=None, timeout=300, used_titles=()):
+    avoid = ""
+    if used_titles:
+        avoid = ("\n\nOther clips from the same stream already use these titles. Write a clearly different "
+                 "title and description (different wording and angle), still true to the facts:\n- "
+                 + "\n- ".join(used_titles))
     prompt = PROMPT.format(stream_title=metadata.get("stream_title") or "unknown",
-                           transcript=(metadata.get("transcript") or "").strip()[:2000] or "(none)")
+                           transcript=(metadata.get("transcript") or "").strip()[:2000] or "(none)", avoid=avoid)
     response = requests.post(f"{url or config.OLLAMA_URL}/api/chat", json={
         "model": model or config.OLLAMA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -100,12 +107,12 @@ def ask_ollama(metadata, model=None, url=None, timeout=300):
     return json.loads(response.json()["message"]["content"])
 
 
-def write_metadata(json_path, force=False):
+def write_metadata(json_path, force=False, used_titles=()):
     metadata = json.loads(json_path.read_text(encoding="utf-8"))
     if metadata.get("title") and not force:
         print(f"{json_path.stem}: already has a title (use --force to regenerate)")
         return metadata
-    title, description, tags = finalize(ask_ollama(metadata), metadata)
+    title, description, tags = finalize(ask_ollama(metadata, used_titles=used_titles), metadata)
     metadata.update({
         "title": title, "youtube_description": description, "hashtags": tags,
         "instagram_caption": description, "metadata_model": f"ollama:{config.OLLAMA_MODEL}",
@@ -126,6 +133,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="regenerate even if a title exists")
     args = parser.parse_args()
     failed = 0
+    used_titles = []
     for arg in args.clips:
         _, json_path = clip_paths(arg)
         if not json_path.is_file():
@@ -133,7 +141,9 @@ def main():
             failed += 1
             continue
         try:
-            write_metadata(json_path, args.force)
+            metadata = write_metadata(json_path, args.force, used_titles)
+            if metadata.get("title"):
+                used_titles.append(metadata["title"])
         except requests.RequestException as error:
             sys.exit(f"Ollama request failed ({error}). Is Ollama running and is {config.OLLAMA_MODEL} pulled?")
         except (KeyError, ValueError) as error:

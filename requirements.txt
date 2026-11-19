@@ -3,3 +3,7 @@ faster-whisper
 yt-dlp
 requests
 opencv-python-headless>=4.10,<6
+google-api-python-client
+google-auth-oauthlib
+nvidia-cublas-cu12; platform_system != "Darwin"
+nvidia-cudnn-cu12; platform_system != "Darwin"

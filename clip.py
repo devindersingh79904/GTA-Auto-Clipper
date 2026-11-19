@@ -6,9 +6,10 @@ import argparse, glob, json, math, os, re, shutil, subprocess, sys, time
 from datetime import datetime
 import numpy as np
 from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window
+import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(HERE, "output")
+OUTPUT_DIR = config.OUTPUT_DIR
 TEST_OUT = os.path.join(HERE, "test_out")
 WORK = os.path.join(HERE, "work")
 DEFAULT_MAX_SECONDS = 0
@@ -173,11 +174,33 @@ def locked_language():
     return None
 
 
+def load_whisper(WhisperModel):
+    """Load the configured model on the GPU; fall back to CPU int8 if CUDA cannot start."""
+    if config.WHISPER_DEVICE == "cuda":
+        config.setup_cuda_dlls()
+        try:
+            model = WhisperModel(config.WHISPER_MODEL, device="cuda", compute_type=config.WHISPER_COMPUTE_TYPE)
+            print(f"speech model: {config.WHISPER_MODEL} on cuda ({config.WHISPER_COMPUTE_TYPE})")
+            return model
+        except (RuntimeError, ValueError) as error:
+            print(f"CUDA speech model failed ({error}); using CPU int8 instead")
+    print(f"speech model: {config.WHISPER_MODEL} on cpu (int8)")
+    return WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+
+
+def release_whisper():
+    """Free the speech model's VRAM before another model (the local LLM) loads."""
+    global _model
+    _model = None
+    import gc
+    gc.collect()
+
+
 def whisper_words(audio):
     global _model
     from faster_whisper import WhisperModel
     if _model is None:
-        _model = WhisperModel("base", device="cpu", compute_type="int8")
+        _model = load_whisper(WhisperModel)
     lock = locked_language()
     segments, info = _model.transcribe(audio, word_timestamps=True, vad_filter=True, task="transcribe", language=lock)
     segments = list(segments)
@@ -575,6 +598,13 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS,ass=" + ass_name)
 
 
+def video_encoder_args(encoder):
+    """Quality-matched settings: NVENC constant quality ~ libx264 CRF 21."""
+    if encoder.endswith("_nvenc"):
+        return ["-c:v", encoder, "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "21", "-b:v", "0"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]
+
+
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
         source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
     d = os.path.dirname(out_mp4)
@@ -582,12 +612,17 @@ def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offs
     write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
                             pan_keys=pan_keys)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                        "-i", os.path.abspath(chunk_path), "-t", f"{length}",
-                        "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
-                        "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-                        os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
+    def render(encoder):
+        return subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
+                               "-i", os.path.abspath(chunk_path), "-t", f"{length}",
+                               "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
+                               *video_encoder_args(encoder),
+                               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                               os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
+    r = render(config.VIDEO_ENCODER)
+    if r.returncode and config.VIDEO_ENCODER != "libx264":
+        print(f"{config.VIDEO_ENCODER} failed ({r.stderr.strip()[-200:]}); retrying with libx264")
+        r = render("libx264")
     os.remove(os.path.join(d, ass_name))
     if r.returncode:
         print("ffmpeg cut failed:", r.stderr[-300:])
@@ -609,7 +644,9 @@ def main():
     ap.add_argument("--chunk", type=int, default=90)
     ap.add_argument("--max-seconds", type=int, default=DEFAULT_MAX_SECONDS,
                     help="stop after N seconds; 0 keeps recording until Ctrl+C (default: 0)")
-    ap.add_argument("--clip-len", type=int, default=30)
+    ap.add_argument("--own-footage", action="store_true",
+                    help="--file is your own recording: render to output/ so the clip can be published")
+    ap.add_argument("--clip-len", type=int, default=config.CLIP_LEN)
     ap.add_argument("--lead-in", type=float, default=6,
                     help="seconds before the detected moment to start each clip")
     ap.add_argument("--top", type=int, default=1, help="clips per chunk")
@@ -633,8 +670,10 @@ def main():
     _forced_language = None if a.spoken_language == "auto" else a.spoken_language
     if not a.url and not a.file:
         sys.exit(__doc__)
-    if a.file and not a.test:
-        sys.exit("--file is only allowed with --test.")
+    if a.own_footage and not a.file:
+        sys.exit("--own-footage only applies to --file (your own local recording).")
+    if a.file and not (a.test or a.own_footage):
+        sys.exit("--file needs --test, or --own-footage if it is your own recording you may publish.")
     if a.file:
         a.file = os.path.abspath(a.file)
         if not os.path.isfile(a.file):
@@ -653,6 +692,9 @@ def main():
             sys.exit("The source is not live. Use --test for a local/non-live test input.")
         who = source_identity(info, a.test)
         title = info.get("title", "")
+    elif a.own_footage and not a.test:
+        who = {"name": "own footage", "credit": None, "channel_id": None, "test": False}
+        title, info = os.path.basename(a.file), {}
     else:
         who, title, info = source_identity({"uploader": "local source"}, True), os.path.basename(a.file), {}
     out_dir = os.path.abspath(a.output_dir) if a.output_dir else (TEST_OUT if who["test"] else OUTPUT_DIR)
@@ -770,6 +812,7 @@ def main():
                 rec.kill()
                 rec.wait()
         shutil.rmtree(wdir, ignore_errors=True)
+        release_whisper()
     print(f"done. {n_clips} clip(s) in {out_dir}. Nothing posted.")
 
 

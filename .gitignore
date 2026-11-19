@@ -18,3 +18,8 @@ output/
 private/
 
 models/person_yolox_s_2022nov.onnx
+
+# YouTube OAuth secrets (never commit)
+client_secret.json
+client_secret*.json
+token.json
